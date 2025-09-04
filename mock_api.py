@@ -1,227 +1,249 @@
+# mock_api.py
 import os
+import math
 import json
-import random
-from datetime import datetime, date
-from pathlib import Path
-from typing import Dict, Any, List, Optional
+import datetime as dt
+from typing import List, Dict, Any, Optional
 
-import uvicorn
-from fastapi import FastAPI, Header, HTTPException, Query
-from fastapi.responses import JSONResponse
 import httpx
+from fastapi import FastAPI, Header, HTTPException, Request
+from fastapi.responses import JSONResponse
 
-app = FastAPI(title="FootyPredict Mock API")
-
-# === Config ===
-DATA_FILE = Path("data.json")
+# ------------------------------------------------------------
+# Config
+# ------------------------------------------------------------
+FD_BASE = "https://api.football-data.org/v4"
+FD_KEY = os.getenv("FOOTBALL_DATA_API_KEY", "")
 CRON_TOKEN = os.getenv("CRON_TOKEN", "")
-FD_API_KEY = os.getenv("FOOTBALL_DATA_API_KEY")  # optional
+COMP_CODES = ["DED", "PL", "PD", "BL1", "FL1"]  # Eredivisie, Premier League, La Liga, Bundesliga, Ligue 1
 
-# football-data.org competition codes
-COMP_CODES = {
-    "Eredivisie": "DED",
-    "Premier League": "PL",
-    "La Liga": "PD",
-    "Bundesliga": "BL1",
-    "Ligue 1": "FL1",
-}
+# We cachen per dag zodat /refresh de data kan “voorwarmen”
+CACHE: Dict[str, List[Dict[str, Any]]] = {}
 
-# In-memory cache
-CACHE: Dict[str, Any] = {
-    # "2025-09-03": { "items": [...], "by_league": {...}, "generated_at": "..."}
-}
+app = FastAPI(title="FootyPredict Mock API", version="2.0")
 
-# ---------- helpers ----------
+# ------------------------------------------------------------
+# Utilities
+# ------------------------------------------------------------
 
-def _today_str() -> str:
-    return date.today().isoformat()
+def _iso(d: dt.date) -> str:
+    return d.strftime("%Y-%m-%d")
 
-def load_cache_from_disk() -> None:
-    if DATA_FILE.exists():
-        try:
-            data = json.loads(DATA_FILE.read_text(encoding="utf-8"))
-            if isinstance(data, dict):
-                CACHE.clear()
-                CACHE.update(data)
-        except Exception:
-            pass  # ignore corrupt file
+def _one_dec(x: float) -> float:
+    return round(x + 1e-9, 1)
 
-def save_cache_to_disk() -> None:
-    try:
-        DATA_FILE.write_text(json.dumps(CACHE, ensure_ascii=False, indent=2), encoding="utf-8")
-    except Exception:
-        pass
+def _clip01(x: float) -> float:
+    return max(0.0, min(1.0, x))
 
-def one_dec(x: float) -> float:
-    return round(float(x) + 1e-9, 1)
+def _poisson_p(k: int, lam: float) -> float:
+    # P(X=k) for Poisson(lam)
+    return (lam ** k) * math.exp(-lam) / math.factorial(k)
 
-def pct(x: float) -> float:
-    return round(100.0 * x)
+def _prob_overs(total_lambda: float, line: float) -> float:
+    # benadering: voor O1.5 / O2.5 / O3.5 tel P(T>=ceil(line+epsilon)) met Poisson(total_lambda)
+    # voor 1.5 => k >= 2, 2.5 => k >= 3, 3.5 => k >= 4
+    kmin = int(math.floor(line + 1.0))  # 1.5->2, 2.5->3, 3.5->4
+    return 1.0 - sum(_poisson_p(k, total_lambda) for k in range(0, kmin))
 
-def _demo_prediction(league: str, home: str, away: str, dt: str) -> Dict[str, Any]:
-    """Fallback: maak nette demo-data met plausibele percentages."""
-    # willekeurige probabilities die netjes optellen
-    p_home = random.uniform(0.35, 0.55)
-    p_draw = random.uniform(0.20, 0.30)
-    p_away = max(0.0, 1.0 - p_home - p_draw)
-    # btts / overs
-    p_btts = random.uniform(0.45, 0.65)
-    p_o15  = random.uniform(0.65, 0.80)
-    p_o25  = random.uniform(0.45, 0.60)
-    p_o35  = random.uniform(0.25, 0.40)
+def _prob_btts(lh: float, la: float) -> float:
+    # BTTS = 1 - P(home=0 or away=0) + P(both 0)
+    p0h = _poisson_p(0, lh)
+    p0a = _poisson_p(0, la)
+    both0 = p0h * p0a
+    return 1.0 - (p0h + p0a - both0)
 
-    # avg goals last 3 (fake maar stabiel)
-    avg_home = one_dec(random.uniform(1.4, 2.3))
-    avg_away = one_dec(random.uniform(1.0, 2.1))
+def _one_x_two(lh: float, la: float, g_cap: int = 6) -> Dict[str, float]:
+    # Simuleer uitslagen 0..g_cap-1 voor home & away met onafhankelijke Poisson
+    p_home = 0.0
+    p_draw = 0.0
+    p_away = 0.0
+    for gh in range(g_cap):
+        ph = _poisson_p(gh, lh)
+        for ga in range(g_cap):
+            pa = _poisson_p(ga, la)
+            pij = ph * pa
+            if gh > ga:
+                p_home += pij
+            elif gh == ga:
+                p_draw += pij
+            else:
+                p_away += pij
+    # normaliseren (numeriek)
+    s = p_home + p_draw + p_away
+    if s > 0:
+        p_home, p_draw, p_away = p_home/s, p_draw/s, p_away/s
+    return {"p_home": p_home, "p_draw": p_draw, "p_away": p_away}
 
-    # top scores
-    scores = [("2-1", 0.18), ("1-1", 0.16), ("2-0", 0.12), ("3-1", 0.11), ("1-2", 0.10)]
-    top_scores = [{"score": s, "p": p} for s, p in scores]
+def _top_correct_scores(lh: float, la: float, topn: int = 5, g_cap: int = 6) -> List[Dict[str, Any]]:
+    grid = []
+    for gh in range(g_cap):
+        ph = _poisson_p(gh, lh)
+        for ga in range(g_cap):
+            pa = _poisson_p(ga, la)
+            grid.append( (gh, ga, ph*pa) )
+    grid.sort(key=lambda x: x[2], reverse=True)
+    out = []
+    tot = sum(p for _,_,p in grid)
+    for gh,ga,p in grid[:topn]:
+        pct = int(round(100 * p / (tot + 1e-12)))
+        out.append({"score": f"{gh}-{ga}", "p": pct/100.0})
+    return out
 
-    return {
-        "home_team": home,
-        "away_team": away,
-        "league": league,
-        "date": dt,
-        "p_home": round(p_home, 2),
-        "p_draw": round(p_draw, 2),
-        "p_away": round(p_away, 2),
-        "p_btts_yes": round(p_btts, 2),
-        "p_over_15": round(p_o15, 2),
-        "p_over_25": round(p_o25, 2),
-        "p_over_35": round(p_o35, 2),
-        "avg_goals_home_last3": avg_home,
-        "avg_goals_away_last3": avg_away,
-        "top_scores": top_scores,
-    }
+# ------------------------------------------------------------
+# Football-Data helpers
+# ------------------------------------------------------------
 
-async def _fetch_from_football_data(target_date: str) -> Dict[str, Any]:
-    """
-    Haal fixtures per competitie op (zonder echte odds).
-    Als geen API-key aanwezig is, bouw demo-data.
-    Resultaat:
-    {
-      "items": [ ...flat list van predictions... ],
-      "by_league": {
-        "Eredivisie": {"matches":[...]} of {"message":"Geen wedstrijden"}
-      },
-      "generated_at": "...UTC..."
-    }
-    """
-    generated_at = datetime.utcnow().isoformat()
-    out_items: List[Dict[str, Any]] = []
-    by_league: Dict[str, Any] = {}
+def _fd_headers() -> Dict[str, str]:
+    if not FD_KEY:
+        raise HTTPException(status_code=500, detail="FOOTBALL_DATA_API_KEY missing")
+    return {"X-Auth-Token": FD_KEY}
 
-    # Zonder key: maak demowedstrijden per competitie
-    if not FD_API_KEY:
-        rnd = random.Random(target_date)  # deterministisch per datum
-        for league in COMP_CODES.keys():
-            # 0–3 demo-wedstrijden
-            n = rnd.randint(0, 3)
-            if n == 0:
-                by_league[league] = {"message": "Geen wedstrijden"}
-                continue
-            matches = []
-            for i in range(n):
-                home = f"{league.split()[0]} Team {i+1}"
-                away = f"{league.split()[0]} Team {i+2}"
-                pred = _demo_prediction(league, home, away, target_date)
-                out_items.append(pred)
-                matches.append(pred)
-            by_league[league] = {"matches": matches}
-        return {"items": out_items, "by_league": by_league, "generated_at": generated_at}
+async def fd_get(client: httpx.AsyncClient, path: str, params: Optional[Dict[str, Any]] = None) -> Any:
+    r = await client.get(f"{FD_BASE}{path}", headers=_fd_headers(), params=params, timeout=30.0)
+    r.raise_for_status()
+    return r.json()
 
-    # Met echte API-key: haal fixtures en bouw synthetische odds (demo)
-    headers = {"X-Auth-Token": FD_API_KEY}
-    async with httpx.AsyncClient(timeout=20) as client:
-        for league, code in COMP_CODES.items():
+async def fetch_matches_for_date(client: httpx.AsyncClient, date_str: str) -> List[Dict[str, Any]]:
+    # /matches?competitions=PL,BL1,...&dateFrom=YYYY-MM-DD&dateTo=YYYY-MM-DD
+    data = await fd_get(client, "/matches", {
+        "competitions": ",".join(COMP_CODES),
+        "dateFrom": date_str,
+        "dateTo": date_str,
+        "status": "SCHEDULED,IN_PLAY,PAUSED,FINISHED",
+        "limit": 200,
+    })
+    matches = data.get("matches", []) or []
+    return matches
+
+async def last3_avg_goals(client: httpx.AsyncClient, team_id: int) -> float:
+    # Laatste 3 gespeelde matches van dit team
+    data = await fd_get(client, f"/teams/{team_id}/matches", {
+        "status": "FINISHED",
+        "limit": 3
+    })
+    ms = data.get("matches", []) or []
+    goals = []
+    for m in ms:
+        home = m["homeTeam"]["id"] == team_id
+        score = m.get("score", {}).get("fullTime", {}) or {}
+        gh = score.get("home", 0) or 0
+        ga = score.get("away", 0) or 0
+        goals_scored = gh if home else ga
+        goals.append(goals_scored)
+    if not goals:
+        return 1.2  # neutraal fallback
+    return _one_dec(sum(goals) / len(goals))
+
+# ------------------------------------------------------------
+# Core: bouwen van onze voorspellingstructuur voor Flutter
+# ------------------------------------------------------------
+
+async def build_predictions_for_date(date_str: str) -> List[Dict[str, Any]]:
+    out: List[Dict[str, Any]] = []
+    async with httpx.AsyncClient() as client:
+        matches = await fetch_matches_for_date(client, date_str)
+
+        # Als niets: geef lege lijst terug (Flutter kan dan "Geen wedstrijden" tonen)
+        if not matches:
+            return []
+
+        for m in matches:
             try:
-                url = f"https://api.football-data.org/v4/competitions/{code}/matches"
-                params = {"dateFrom": target_date, "dateTo": target_date}
-                r = await client.get(url, headers=headers, params=params)
-                r.raise_for_status()
-                data = r.json()
-                matches = data.get("matches", []) or []
-                league_list = []
-                if not matches:
-                    by_league[league] = {"message": "Geen wedstrijden"}
-                    continue
-                for m in matches:
-                    home = m["homeTeam"]["name"]
-                    away = m["awayTeam"]["name"]
-                    # synthetische odds (tot je echte model koppelt)
-                    pred = _demo_prediction(league, home, away, target_date)
-                    out_items.append(pred)
-                    league_list.append(pred)
-                by_league[league] = {"matches": league_list}
+                comp = (m.get("competition") or {}).get("code") or ""
+                home = (m.get("homeTeam") or {}).get("name") or "Home"
+                away = (m.get("awayTeam") or {}).get("name") or "Away"
+                hid = (m.get("homeTeam") or {}).get("id")
+                aid = (m.get("awayTeam") or {}).get("id")
+
+                # Gemiddelde goals laatste 3 (per team)
+                avg_h = await last3_avg_goals(client, hid) if hid else 1.2
+                avg_a = await last3_avg_goals(client, aid) if aid else 1.2
+
+                # Expected goals voor de wedstrijd (heel simpel model)
+                # kleine home advantage factor
+                lam_h = max(0.3, avg_h + 0.2)
+                lam_a = max(0.3, avg_a)
+
+                one_x_two_p = _one_x_two(lam_h, lam_a)
+                total_lambda = lam_h + lam_a
+
+                p_btts = _prob_btts(lam_h, lam_a)
+                p_o15 = _prob_overs(total_lambda, 1.5)
+                p_o25 = _prob_overs(total_lambda, 2.5)
+                p_o35 = _prob_overs(total_lambda, 3.5)
+
+                top_scores = _top_correct_scores(lam_h, lam_a, topn=5, g_cap=6)
+
+                out.append({
+                    "home_team": home,
+                    "away_team": away,
+                    "league": comp,         # code (DED/PL/…); je UI toont de league-naam al afzonderlijk
+                    "date": date_str,
+                    "p_home": round(one_x_two_p["p_home"], 2),
+                    "p_draw": round(one_x_two_p["p_draw"], 2),
+                    "p_away": round(one_x_two_p["p_away"], 2),
+                    "p_btts_yes": round(p_btts, 2),
+                    "p_over_15": round(p_o15, 2),
+                    "p_over_25": round(p_o25, 2),
+                    "p_over_35": round(p_o35, 2),
+                    "avg_goals_home_last3": avg_h,
+                    "avg_goals_away_last3": avg_a,
+                    "top_scores": top_scores,
+                })
             except Exception:
-                # bij fout: toon geen crashes, maar "geen wedstrijden"
-                by_league[league] = {"message": "Geen wedstrijden"}
+                # Bij een enkele failure: sla die match over i.p.v. alles stuk te maken
+                continue
+    return out
 
-    return {"items": out_items, "by_league": by_league, "generated_at": generated_at}
-
-async def build_or_get_for_date(target_date: str) -> Dict[str, Any]:
-    # cache opvragen of maken
-    if target_date in CACHE:
-        return CACHE[target_date]
-    data = await _fetch_from_football_data(target_date)
-    CACHE[target_date] = data
-    save_cache_to_disk()
-    return data
-
-# ---------- endpoints ----------
+# ------------------------------------------------------------
+# Endpoints
+# ------------------------------------------------------------
 
 @app.get("/")
 async def root():
-    return {"ok": True, "service": "FootyPredict Mock API", "utc": datetime.utcnow().isoformat()}
-
-@app.get("/health")
-async def health():
-    return {"ok": True}
+    return {"ok": True, "service": "FootyPredict Mock API", "utc": dt.datetime.utcnow().isoformat()}
 
 @app.get("/predictions")
-async def predictions(d: Optional[str] = Query(None, description="YYYY-MM-DD")):
+async def predictions(d: Optional[str] = None):
     """
-    Haal predictions voor een dag op (alle competities samengevoegd).
-    Voor jouw Flutter-app kun je d weglaten; default = vandaag.
+    GET /predictions?d=YYYY-MM-DD  (default: vandaag)
     """
-    target = d or _today_str()
-    data = await build_or_get_for_date(target)
-    # Voor backward compatibility geven we nog steeds een platte lijst terug
-    return JSONResponse(data["items"])
+    if d is None:
+        d = _iso(dt.date.today())
+
+    # cache check
+    if d in CACHE:
+        return JSONResponse(CACHE[d])
+
+    try:
+        data = await build_predictions_for_date(d)
+    except httpx.HTTPStatusError as e:
+        # doorgeven met nette melding
+        raise HTTPException(status_code=e.response.status_code, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+    CACHE[d] = data
+    return JSONResponse(data)
 
 @app.post("/refresh")
-async def refresh(x_cron_token: Optional[str] = Header(None, convert_underscores=False),
-                  d: Optional[str] = Query(None, description="YYYY-MM-DD (optioneel)")):
+async def refresh(request: Request, x_cron_token: Optional[str] = Header(None)):
     """
-    Wordt dagelijks aangeroepen door GitHub Actions.
-    Vereist header: X-CRON-TOKEN: <token>
+    POST /refresh
+    Protected door header: X-CRON-TOKEN: <CRON_TOKEN>
+    Vult vandaag (en optioneel morgen) in de cache.
     """
     if not CRON_TOKEN:
-        raise HTTPException(status_code=500, detail="CRON_TOKEN is niet geconfigureerd")
-    if x_cron_token is None or x_cron_token != CRON_TOKEN:
-        raise HTTPException(status_code=401, detail="Ongeldige of ontbrekende X-CRON-TOKEN")
+        raise HTTPException(status_code=500, detail="CRON_TOKEN env missing on server")
+    if x_cron_token != CRON_TOKEN:
+        raise HTTPException(status_code=401, detail="Invalid token")
 
-    target = d or _today_str()
-    data = await _fetch_from_football_data(target)
-    CACHE[target] = data
-    save_cache_to_disk()
-    return {"ok": True, "refreshed": target, "items": len(data.get("items", []))}
-
-# ---------- startup ----------
-
-@app.on_event("startup")
-async def _startup():
-    load_cache_from_disk()
-    # zorg dat vandaag alvast gevuld is (handig bij cold start)
+    today = _iso(dt.date.today())
     try:
-        await build_or_get_for_date(_today_str())
-    except Exception:
-        pass
+        CACHE[today] = await build_predictions_for_date(today)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"refresh failed: {e}")
 
-# ---------- local run ----------
+    return {"ok": True, "cached_dates": [k for k in CACHE.keys() if k == today]}
 
-if __name__ == "__main__":
-    port = int(os.getenv("PORT", "8888"))
-    # host=0.0.0.0 is voor Render; lokaal kan je 127.0.0.1 gebruiken
-    uvicorn.run("mock_api:app", host="0.0.0.0", port=port, reload=False)
+# Render start command expects: uvicorn mock_api:app --host 0.0.0.0 --port $PORT
