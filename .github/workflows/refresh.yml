@@ -1,0 +1,16 @@
+name: Daily Refresh
+
+on:
+  schedule:
+    - cron: "0 5 * * *"        # draait elke dag om 05:00 UTC
+  workflow_dispatch:           # maakt handmatig starten mogelijk
+
+jobs:
+  refresh:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Call refresh endpoint
+        run: |
+          curl -X POST \
+               -H "X-CRON-TOKEN: ${{ secrets.CRON_TOKEN }}" \
+               "${{ secrets.RENDER_REFRESH_URL }}"
